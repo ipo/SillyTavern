@@ -1484,29 +1484,36 @@ export function formatReasoning(reasoning, content, template = null) {
  * @param {string[]} swipes Array of swipe strings
  * @param {{extra: Partial<ReasoningMessageExtra>}[]} swipeInfoArray Array of swipe info objects
  * @param {number?} duration Duration of the reasoning
+ * @param {string[]} [modelReasoning] Explicit model reasoning aligned with swipes
  * @typedef {object} ReasoningMessageExtra Extra reasoning data
  * @property {string} reasoning Reasoning block
  * @property {number} reasoning_duration Duration of the reasoning block
  * @property {string} reasoning_type Type of reasoning block
  * @property {string?} reasoning_signature Encrypted signature of the reasoning text
  */
-export function parseReasoningInSwipes(swipes, swipeInfoArray, duration) {
-    if (!power_user.reasoning.auto_parse) {
-        return;
-    }
-
+export function parseReasoningInSwipes(swipes, swipeInfoArray, duration, modelReasoning = []) {
     // Something ain't right, don't parse
     if (!Array.isArray(swipes) || !Array.isArray(swipeInfoArray) || swipes.length !== swipeInfoArray.length) {
         return;
     }
 
     for (let index = 0; index < swipes.length; index++) {
-        const parsedReasoning = parseReasoningFromString(swipes[index]);
-        if (parsedReasoning) {
-            swipes[index] = getRegexedString(parsedReasoning.content, regex_placement.REASONING);
-            swipeInfoArray[index].extra.reasoning = parsedReasoning.reasoning;
-            swipeInfoArray[index].extra.reasoning_duration = duration;
-            swipeInfoArray[index].extra.reasoning_type = ReasoningType.Parsed;
+        if (power_user.reasoning.auto_parse && typeof swipes[index] === 'string') {
+            const parsedReasoning = parseReasoningFromString(swipes[index]);
+            // parseReasoningFromString returns an unchanged result when no wrapper matches.
+            if (parsedReasoning && parsedReasoning.content !== swipes[index]) {
+                swipes[index] = getRegexedString(parsedReasoning.content, regex_placement.REASONING);
+                swipeInfoArray[index].extra.reasoning = parsedReasoning.reasoning;
+                swipeInfoArray[index].extra.reasoning_duration = duration;
+                swipeInfoArray[index].extra.reasoning_type = ReasoningType.Parsed;
+            }
+        }
+
+        const explicitReasoning = Array.isArray(modelReasoning) ? modelReasoning[index] : undefined;
+        if (typeof explicitReasoning === 'string' && explicitReasoning) {
+            swipeInfoArray[index].extra.reasoning = getRegexedString(explicitReasoning, regex_placement.REASONING);
+            delete swipeInfoArray[index].extra.reasoning_duration;
+            swipeInfoArray[index].extra.reasoning_type = ReasoningType.Model;
         }
     }
 }

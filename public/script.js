@@ -3513,6 +3513,8 @@ class StreamingProcessor {
         this.createdAt = new Date();
         this.continueMessage = type === 'continue' ? continueMessage : '';
         this.swipes = [];
+        /** @type {string[]} */
+        this.swipeReasoning = [];
         /** @type {import('./scripts/logprobs.js').TokenLogprobs[]} */
         this.messageLogprobs = [];
         this.toolCalls = [];
@@ -3713,7 +3715,7 @@ class StreamingProcessor {
                 extra: swipeInfoExtra,
             };
             const swipeInfoArray = Array(this.swipes.length).fill().map(() => structuredClone(swipeInfo));
-            parseReasoningInSwipes(this.swipes, swipeInfoArray, message.extra?.reasoning_duration);
+            parseReasoningInSwipes(this.swipes, swipeInfoArray, message.extra?.reasoning_duration, this.swipeReasoning);
             message.swipes.push(...this.swipes);
             message.swipe_info.push(...swipeInfoArray);
         }
@@ -3791,7 +3793,7 @@ class StreamingProcessor {
     }
 
     /**
-     * @returns {AsyncGenerator<{ text: string, swipes: string[], logprobs: import('./scripts/logprobs.js').TokenLogprobs, toolCalls: any[], state: any }, void, void>}
+     * @returns {AsyncGenerator<{ text: string, swipes: string[], swipeReasoning?: string[], logprobs: import('./scripts/logprobs.js').TokenLogprobs, toolCalls: any[], state: any }, void, void>}
      */
     async* nullStreamingGeneration() {
         throw new Error('Generation function for streaming is not hooked up');
@@ -3813,7 +3815,7 @@ class StreamingProcessor {
         try {
             const sw = new Stopwatch(1000 / power_user.streaming_fps);
             const timestamps = [];
-            for await (const { text, swipes, logprobs, toolCalls, state } of this.generator()) {
+            for await (const { text, swipes, swipeReasoning, logprobs, toolCalls, state } of this.generator()) {
                 const now = Date.now();
                 timestamps.push(now);
                 if (!this.timeToFirstToken) {
@@ -3826,6 +3828,9 @@ class StreamingProcessor {
                 this.toolCalls = toolCalls;
                 this.result = text;
                 this.swipes = Array.from(swipes ?? []);
+                if (Array.isArray(swipeReasoning)) {
+                    this.swipeReasoning = Array.from(swipeReasoning);
+                }
                 if (logprobs) {
                     this.messageLogprobs.push(...(Array.isArray(logprobs) ? logprobs : [logprobs]));
                 }

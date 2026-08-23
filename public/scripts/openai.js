@@ -3070,8 +3070,10 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null } =
         return async function* streamData() {
             let text = '';
             const swipes = [];
+            const swipeReasoning = [];
             const toolCalls = [];
             const state = { reasoning: '', images: [], signature: '', toolSignatures: {} };
+            const swipeStates = [];
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) return;
@@ -3080,17 +3082,27 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null } =
                 tryParseStreamingError(response, rawData);
                 const parsed = JSON.parse(rawData);
 
-                if (canMultiSwipe && Array.isArray(parsed?.choices) && parsed?.choices?.[0]?.index > 0) {
-                    const swipeIndex = parsed.choices[0].index - 1;
-                    // FIXME: state.reasoning should be an array to support multi-swipe
-                    swipes[swipeIndex] = (swipes[swipeIndex] || '') + getStreamingReply(parsed, state, { overrideShowThoughts: false });
+                if (canMultiSwipe && Array.isArray(parsed?.choices)) {
+                    for (const choice of parsed.choices) {
+                        // getStreamingReply only reads the first choice, so isolate each choice in case a
+                        // provider groups multiple indexes into one SSE event.
+                        const choiceData = { ...parsed, choices: [choice] };
+                        if (choice?.index > 0) {
+                            const swipeIndex = choice.index - 1;
+                            const swipeState = swipeStates[swipeIndex] ??= { reasoning: '', images: [], signature: '', toolSignatures: {} };
+                            swipes[swipeIndex] = (swipes[swipeIndex] || '') + getStreamingReply(choiceData, swipeState);
+                            swipeReasoning[swipeIndex] = swipeState.reasoning;
+                        } else {
+                            text += getStreamingReply(choiceData, state);
+                        }
+                    }
                 } else {
                     text += getStreamingReply(parsed, state);
                 }
 
                 ToolManager.parseToolCalls(toolCalls, parsed, state.toolSignatures);
 
-                yield { text, swipes: swipes, logprobs: parseChatCompletionLogprobs(parsed), toolCalls: toolCalls, state: state };
+                yield { text, swipes: swipes, swipeReasoning: swipeReasoning, logprobs: parseChatCompletionLogprobs(parsed), toolCalls: toolCalls, state: state };
             }
         };
     } else {
