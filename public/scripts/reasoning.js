@@ -230,10 +230,11 @@ export function isHiddenReasoningModel() {
  * @param {number|JQuery<HTMLElement>|HTMLElement} messageIdOrElement The message ID or the message element
  * @param {Object} [options={}] - Optional arguments
  * @param {boolean} [options.reset=false] - Whether to reset state, and not take the current mess properties (for example when swiping)
+ * @param {ChatMessage} [options.messageSnapshot] - Read-only message data to render instead of the persisted chat message
  */
-export function updateReasoningUI(messageIdOrElement, { reset = false } = {}) {
+export function updateReasoningUI(messageIdOrElement, { reset = false, messageSnapshot = undefined } = {}) {
     const handler = new ReasoningHandler();
-    handler.initHandleMessage(messageIdOrElement, { reset });
+    handler.initHandleMessage(messageIdOrElement, { reset, messageSnapshot });
 }
 
 
@@ -315,8 +316,9 @@ export class ReasoningHandler {
      * @param {number|JQuery<HTMLElement>|HTMLElement} messageIdOrElement - The message ID or the message element
      * @param {Object} [options={}] - Optional arguments
      * @param {boolean} [options.reset=false] - Whether to reset state of the handler, and not take the current mess properties (for example when swiping)
+     * @param {ChatMessage} [options.messageSnapshot] - Read-only message data to render instead of the persisted chat message
      */
-    initHandleMessage(messageIdOrElement, { reset = false } = {}) {
+    initHandleMessage(messageIdOrElement, { reset = false, messageSnapshot = undefined } = {}) {
         /** @type {HTMLElement} */
         const messageElement = typeof messageIdOrElement === 'number'
             ? document.querySelector(`#chat [mesid="${messageIdOrElement}"]`)
@@ -327,12 +329,15 @@ export class ReasoningHandler {
 
         if (isNaN(messageId) || !chat[messageId]) return;
 
-        if (!chat[messageId].extra) {
-            chat[messageId].extra = {};
+        const message = messageSnapshot ?? chat[messageId];
+        if (!message.extra && !messageSnapshot) {
+            message.extra = {};
         }
-        const extra = chat[messageId].extra;
+        const extra = message.extra ?? {};
 
-        if (extra.reasoning) {
+        if (messageSnapshot && Object.values(ReasoningState).includes(extra.reasoning_state)) {
+            this.state = extra.reasoning_state;
+        } else if (extra.reasoning) {
             this.state = ReasoningState.Done;
         } else if (extra.reasoning_duration) {
             this.state = ReasoningState.Hidden;
@@ -343,7 +348,7 @@ export class ReasoningHandler {
         this.reasoningDisplayText = extra?.reasoning_display_text ?? null;
 
         if (this.state !== ReasoningState.None) {
-            this.initialTime = new Date(chat[messageId].gen_started);
+            this.initialTime = new Date(message.gen_started);
             this.startTime = this.initialTime;
             this.endTime = new Date(this.startTime.getTime() + (extra?.reasoning_duration ?? 0));
         }

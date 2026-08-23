@@ -1364,6 +1364,19 @@ body.hideAllSwipeButtons :is(.swipe_left, .swipe_right),
     pointer-events: none;
 }
 
+/* During one active streamed multi-swipe batch, expose only its transient controls. */
+body.hideAllSwipeButtons .mes.live-multiswipe :is(.swipe_left, .swipe_right, .swipes-counter),
+.mes.live-multiswipe:not(.swipes_visible) :is(.swipe_left, .swipe_right) {
+    opacity: 0.3 !important;
+    visibility: visible;
+    interactivity: auto;
+    pointer-events: auto;
+}
+
+.mes.live-multiswipe :is(.swipe_left, .swipe_right).live-swipe-boundary {
+    opacity: 0.15 !important;
+}
+
 .ui-settings {
     display: flex;
     flex-direction: column;

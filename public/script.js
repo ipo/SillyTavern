@@ -3515,6 +3515,13 @@ class StreamingProcessor {
         this.swipes = [];
         /** @type {string[]} */
         this.swipeReasoning = [];
+        /** @type {number?} Stable absolute swipe ID assigned to provider choice 0. */
+        this.primarySwipeId = null;
+        /** @type {number} Provider choice currently rendered in the live message. */
+        this.selectedProviderIndex = 0;
+        /** @type {Set<number>} Provider choices that have actually appeared in the stream. */
+        this.observedProviderIndexes = new Set();
+        this.alternativesFinalized = false;
         /** @type {import('./scripts/logprobs.js').TokenLogprobs[]} */
         this.messageLogprobs = [];
         this.toolCalls = [];
@@ -3546,6 +3553,144 @@ class StreamingProcessor {
         this.reasoningHandler.updateDom(messageId);
     }
 
+    /** @returns {number[]} Sorted provider indexes which have appeared in this batch. */
+    #getObservedProviderIndexes() {
+        return Array.from(this.observedProviderIndexes)
+            .map(Number)
+            .filter(index => Number.isInteger(index) && index >= 0)
+            .sort((a, b) => a - b);
+    }
+
+    #updateLiveControls() {
+        if (!(this.messageDom instanceof HTMLElement) || this.isStopped || this.alternativesFinalized) {
+            return;
+        }
+
+        const observed = this.#getObservedProviderIndexes();
+        if (!observed.includes(this.selectedProviderIndex) && observed.length > 0) {
+            this.selectedProviderIndex = observed[0];
+            this.#renderLiveSelection();
+        }
+        if (observed.length < 2) {
+            return;
+        }
+
+        const position = observed.indexOf(this.selectedProviderIndex);
+        if (position === -1) {
+            return;
+        }
+
+        this.messageDom.classList.add('live-multiswipe');
+        const left = this.messageDom.querySelector('.swipe_left');
+        const right = this.messageDom.querySelector('.swipe_right');
+        const counter = this.messageDom.querySelector('.swipes-counter');
+        left?.setAttribute('aria-disabled', String(position === 0));
+        right?.setAttribute('aria-disabled', String(position === observed.length - 1));
+        left?.classList.toggle('live-swipe-boundary', position === 0);
+        right?.classList.toggle('live-swipe-boundary', position === observed.length - 1);
+        if (counter instanceof HTMLElement) {
+            counter.hidden = false;
+            counter.textContent = formatSwipeCounter(position + 1, observed.length);
+            counter.classList.remove('swipe-picker-enabled', INTERACTABLE_CONTROL_CLASS);
+            counter.removeAttribute('role');
+            counter.removeAttribute('title');
+            counter.removeAttribute('tabindex');
+        }
+        this.messageDom.querySelector('.mes_swipe_picker')?.setAttribute('style', 'display: none;');
+    }
+
+    #deactivateLiveControls() {
+        if (!(this.messageDom instanceof HTMLElement)) {
+            return;
+        }
+        this.messageDom.classList.remove('live-multiswipe');
+        for (const arrow of this.messageDom.querySelectorAll('.swipe_left, .swipe_right')) {
+            arrow.removeAttribute('aria-disabled');
+            arrow.classList.remove('live-swipe-boundary');
+        }
+        const counter = this.messageDom.querySelector('.swipes-counter');
+        if (counter instanceof HTMLElement) {
+            counter.hidden = true;
+        }
+    }
+
+    #getAlternateSnapshot(providerIndex, isFinal = false) {
+        const message = chat[this.messageId];
+        const swipeIndex = providerIndex - 1;
+        if (!message || typeof this.swipes[swipeIndex] !== 'string') {
+            return null;
+        }
+
+        const text = cleanUpMessage({
+            getMessage: this.swipes[swipeIndex],
+            isImpersonate: false,
+            isContinue: false,
+            displayIncompleteSentences: !isFinal,
+            stoppingStrings: this.stoppingStrings,
+        });
+        const extra = structuredClone(message.extra ?? {});
+        delete extra.token_count;
+        delete extra.reasoning;
+        delete extra.reasoning_duration;
+        delete extra.reasoning_type;
+        delete extra.reasoning_display_text;
+        const texts = [text];
+        const swipeInfo = [{ extra }];
+        parseReasoningInSwipes(texts, swipeInfo, message.extra?.reasoning_duration, [this.swipeReasoning[swipeIndex]]);
+        if (swipeInfo[0].extra.reasoning) {
+            swipeInfo[0].extra.reasoning_state = 'thinking';
+        }
+        return { ...message, mes: texts[0], extra: swipeInfo[0].extra };
+    }
+
+    #renderLiveSelection(isFinal = false) {
+        if (!(this.messageTextDom instanceof HTMLElement) || !chat[this.messageId]) {
+            return;
+        }
+
+        const snapshot = this.selectedProviderIndex === 0
+            ? chat[this.messageId]
+            : this.#getAlternateSnapshot(this.selectedProviderIndex, isFinal);
+        if (!snapshot) {
+            return;
+        }
+        const formattedText = messageFormatting(snapshot.mes, snapshot.name, snapshot.is_system, snapshot.is_user, this.messageId, {}, false);
+        if (power_user.stream_fade_in) {
+            applyStreamFadeIn(this.messageTextDom, formattedText);
+        } else {
+            this.messageTextDom.innerHTML = formattedText;
+        }
+        if (this.selectedProviderIndex === 0) {
+            this.reasoningHandler.updateDom(this.messageId);
+        } else {
+            updateReasoningUI(this.messageDom, { messageSnapshot: snapshot });
+        }
+    }
+
+    /**
+     * Handles an arrow/touch-triggered navigation attempt without entering ordinary swipe behavior.
+     * @returns {boolean} Whether this active live batch consumed the attempt.
+     */
+    tryNavigateLiveSwipe(direction, messageId, event, source) {
+        const isArrow = event?.currentTarget?.matches?.('.swipe_left, .swipe_right');
+        if (source !== undefined || !isArrow || messageId !== this.messageId || this.isStopped || this.isFinished || this.alternativesFinalized) {
+            return false;
+        }
+        const observed = this.#getObservedProviderIndexes();
+        if (observed.length < 2) {
+            return false;
+        }
+        const position = observed.indexOf(this.selectedProviderIndex);
+        const nextPosition = direction === SWIPE_DIRECTION.RIGHT ? position + 1 : position - 1;
+        if (position < 0 || nextPosition < 0 || nextPosition >= observed.length) {
+            return true;
+        }
+        this.selectedProviderIndex = observed[nextPosition];
+        this.#renderLiveSelection();
+        this.#updateLiveControls();
+        return true;
+    }
+
     #updateMessageBlockVisibility() {
         if (this.messageDom instanceof HTMLElement && Array.isArray(this.toolCalls) && this.toolCalls.length > 0) {
             const shouldHide = ['', '...'].includes(this.result) && !this.reasoningHandler.reasoning;
@@ -3575,6 +3720,7 @@ class StreamingProcessor {
         } else {
             await saveReply({ type: this.type, getMessage: text, fromStreaming: true });
             messageId = chat.length - 1;
+            this.primarySwipeId = Number(chat[messageId].swipe_id);
             await this.#checkDomElements(messageId, continueOnReasoning);
             this.markUIGenStarted();
         }
@@ -3586,18 +3732,6 @@ class StreamingProcessor {
     async onProgressStreaming(messageId, text, isFinal) {
         const isImpersonate = this.type == 'impersonate';
         const isContinue = this.type == 'continue';
-
-        if (!isImpersonate && !isContinue && Array.isArray(this.swipes) && this.swipes.length > 0) {
-            for (let i = 0; i < this.swipes.length; i++) {
-                this.swipes[i] = cleanUpMessage({
-                    getMessage: this.swipes[i],
-                    isImpersonate: false,
-                    isContinue: false,
-                    displayIncompleteSentences: true,
-                    stoppingStrings: this.stoppingStrings,
-                });
-            }
-        }
 
         let processedText = cleanUpMessage({
             getMessage: text,
@@ -3672,6 +3806,11 @@ class StreamingProcessor {
                 }
             }
 
+            if (this.selectedProviderIndex !== 0) {
+                this.#renderLiveSelection();
+            }
+            this.#updateLiveControls();
+
             const timePassed = formatGenerationTimer(this.timeStarted, currentTime, currentTokenCount, this.reasoningHandler.getDuration(), this.timeToFirstToken);
             if (this.messageTimerDom instanceof HTMLElement) {
                 this.messageTimerDom.textContent = timePassed.timerValue;
@@ -3697,30 +3836,51 @@ class StreamingProcessor {
      */
     async finalizeIntermediaryMessage(messageId, text, { unlockUI = true }) {
         await this.onProgressStreaming(messageId, text, true);
-        const messageElement = chatElement.find(`.mes[mesid="${messageId}"]`);
         const message = chat[messageId];
-        addCopyToCodeBlocks(messageElement);
 
         await this.reasoningHandler.finish(messageId);
 
-        if (Array.isArray(this.swipes) && this.swipes.length > 0) {
+        if (message && !this.alternativesFinalized) {
+            syncMesToSwipe(messageId);
+            const observed = this.#getObservedProviderIndexes();
+            const alternativeProviderIndexes = observed.filter(providerIndex => providerIndex !== 0);
+            const finalizedProviderIndexes = [0, ...alternativeProviderIndexes];
+            const finalizedSwipes = alternativeProviderIndexes.map(providerIndex => this.#getAlternateSnapshot(providerIndex, true));
             const swipeInfoExtra = structuredClone(message.extra ?? {});
             delete swipeInfoExtra.token_count;
             delete swipeInfoExtra.reasoning;
             delete swipeInfoExtra.reasoning_duration;
+            delete swipeInfoExtra.reasoning_type;
             const swipeInfo = {
                 send_date: message.send_date,
                 gen_started: message.gen_started,
                 gen_finished: message.gen_finished,
                 extra: swipeInfoExtra,
             };
-            const swipeInfoArray = Array(this.swipes.length).fill().map(() => structuredClone(swipeInfo));
-            parseReasoningInSwipes(this.swipes, swipeInfoArray, message.extra?.reasoning_duration, this.swipeReasoning);
-            message.swipes.push(...this.swipes);
+            const finalTexts = finalizedSwipes.map(snapshot => snapshot.mes);
+            const swipeInfoArray = finalizedSwipes.map(snapshot => {
+                const info = { ...structuredClone(swipeInfo), extra: structuredClone(snapshot.extra) };
+                delete info.extra.reasoning_state;
+                return info;
+            });
+            message.swipes.push(...finalTexts);
             message.swipe_info.push(...swipeInfoArray);
+            const selectedPosition = finalizedProviderIndexes.indexOf(this.selectedProviderIndex);
+            const selectedSwipeId = Number(this.primarySwipeId) + Math.max(0, selectedPosition);
+            syncSwipeToMes(messageId, selectedSwipeId);
+            this.alternativesFinalized = true;
         }
 
-        syncMesToSwipe(messageId);
+        this.#deactivateLiveControls();
+        const messageElement = chatElement.find(`.mes[mesid="${messageId}"]`);
+        if (message) {
+            const formattedText = messageFormatting(message.mes, message.name, message.is_system, message.is_user, messageId, {}, false);
+            if (this.messageTextDom instanceof HTMLElement) {
+                this.messageTextDom.innerHTML = formattedText;
+            }
+            updateReasoningUI(this.messageDom, { messageSnapshot: message });
+            addCopyToCodeBlocks(messageElement);
+        }
         saveLogprobsForActiveMessage(this.messageLogprobs.filter(Boolean), this.continueMessage);
 
         if (Array.isArray(this.images) && this.images.length > 0) {
@@ -3761,6 +3921,7 @@ class StreamingProcessor {
     }
 
     onErrorStreaming() {
+        this.#discardLiveAlternatives();
         this.abortController.abort();
         this.isStopped = true;
 
@@ -3788,8 +3949,18 @@ class StreamingProcessor {
     }
 
     onStopStreaming() {
+        this.#discardLiveAlternatives();
         this.abortController.abort();
         this.isFinished = true;
+    }
+
+    #discardLiveAlternatives() {
+        this.selectedProviderIndex = 0;
+        this.observedProviderIndexes.clear();
+        this.swipes = [];
+        this.swipeReasoning = [];
+        this.#deactivateLiveControls();
+        this.#renderLiveSelection();
     }
 
     /**
@@ -3827,9 +3998,9 @@ class StreamingProcessor {
 
                 this.toolCalls = toolCalls;
                 this.result = text;
-                this.swipes = Array.from(swipes ?? []);
+                this.swipes = Array.isArray(swipes) ? swipes.slice() : [];
                 if (Array.isArray(swipeReasoning)) {
-                    this.swipeReasoning = Array.from(swipeReasoning);
+                    this.swipeReasoning = swipeReasoning.slice();
                 }
                 if (logprobs) {
                     this.messageLogprobs.push(...(Array.isArray(logprobs) ? logprobs : [logprobs]));
@@ -3838,6 +4009,23 @@ class StreamingProcessor {
                 this.reasoningHandler.updateReasoning(this.messageId, state?.reasoning);
                 this.images = state?.images ?? [];
                 this.reasoningSignature = state?.signature ?? null;
+                if (Array.isArray(state?.observedChoices)) {
+                    for (const providerIndex of state.observedChoices) {
+                        if (Number.isInteger(providerIndex) && providerIndex >= 0) {
+                            this.observedProviderIndexes.add(providerIndex);
+                        }
+                    }
+                } else {
+                    if (text || state?.reasoning) {
+                        this.observedProviderIndexes.add(0);
+                    }
+                    for (const swipeIndex of Object.keys(this.swipes).map(Number)) {
+                        if (typeof this.swipes[swipeIndex] === 'string') {
+                            this.observedProviderIndexes.add(swipeIndex + 1);
+                        }
+                    }
+                }
+                this.#updateLiveControls();
                 await eventSource.emit(event_types.STREAM_TOKEN_RECEIVED, text);
                 await sw.tick(async () => await this.onProgressStreaming(this.messageId, this.continueMessage + text));
             }
@@ -9914,6 +10102,12 @@ export async function swipe(event, direction, { source, repeated, message = chat
     }
 
     const mesId = Number(forceMesId ?? event?.currentTarget?.closest('.mes')?.getAttribute('mesid') ?? messageIndex ?? chat.length - 1);
+
+    // Live multi-swipe navigation is a transient DOM-only path. Consume it before
+    // ordinary swipe guards, persistence, events, aborts, and overswipe generation.
+    if (streamingProcessor?.tryNavigateLiveSwipe(direction, mesId, event, source)) {
+        return;
+    }
 
     if ([SWIPE_SOURCE.DELETE, SWIPE_SOURCE.BACK, SWIPE_SOURCE.AUTO_SWIPE, SWIPE_SOURCE.SLASH_COMMAND, SWIPE_SOURCE.SWIPE_PICKER].includes(source)) {
         console.info(`The ${direction} swipe source on message #${mesId} is ${source}, Most checks have been bypassed. `);

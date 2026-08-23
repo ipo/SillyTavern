@@ -3074,6 +3074,7 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null } =
             const toolCalls = [];
             const state = { reasoning: '', images: [], signature: '', toolSignatures: {} };
             const swipeStates = [];
+            const observedChoices = new Set();
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) return;
@@ -3084,6 +3085,10 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null } =
 
                 if (canMultiSwipe && Array.isArray(parsed?.choices)) {
                     for (const choice of parsed.choices) {
+                        if (Number.isInteger(choice?.index) && choice.index >= 0) {
+                            observedChoices.add(choice.index);
+                            state.observedChoices = Array.from(observedChoices).sort((a, b) => a - b);
+                        }
                         // getStreamingReply only reads the first choice, so isolate each choice in case a
                         // provider groups multiple indexes into one SSE event.
                         const choiceData = { ...parsed, choices: [choice] };
