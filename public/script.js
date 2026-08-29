@@ -413,6 +413,9 @@ export let chat = [];
  * @type {import('./scripts/constants.js').SWIPE_STATE}
  */
 export let swipeState = SWIPE_STATE.NONE;
+/** @type {{ target: ChatMessage, chatId: string, canceled: boolean, eligible: boolean, automaticRequest: boolean, task: Promise<void> } | null} */
+let continuousMultiSwipeSession = null;
+let continuousMultiSwipeGenerationDepth = 0;
 let chatSaveTimeout;
 let importFlashTimeout;
 export let isChatSaving = false;
@@ -1703,6 +1706,16 @@ export async function reloadCurrentChatUnsafe() {
  * Send the message currently typed into the chat box.
  */
 export async function sendTextareaMessage() {
+    const submittedText = String($('#send_textarea').val());
+    if (submittedText && continuousMultiSwipeSession) {
+        const session = continuousMultiSwipeSession;
+        cancelContinuousMultiSwipeSession();
+        if (session.automaticRequest) {
+            abortActiveGeneration('Typed message submitted during continuous multi-swipe generation');
+        }
+        await session.task;
+    }
+
     // don't proceed during swipeGenerate()
     if (swipeState == SWIPE_STATE.EDITING) {
         toastr.warning(t`Confirm the edit to start a generation.`, t`You cannot send a message during a swipe-edit.`);
@@ -3950,9 +3963,11 @@ class StreamingProcessor {
     }
 
     async onFinishStreaming(messageId, text) {
+        const swipeCountBefore = chat[messageId]?.swipes?.length ?? 0;
         await this.finalizeIntermediaryMessage(messageId, text, { unlockUI: true });
 
         const isAborted = this.abortController.signal.aborted;
+        recordContinuousMultiSwipeResult(this.type, chat[messageId], !isAborted && (chat[messageId]?.swipes?.length ?? 0) > swipeCountBefore);
         if (!isAborted && power_user.auto_swipe && generatedTextFiltered(text)) {
             return await swipe(null, SWIPE_DIRECTION.RIGHT, { source: SWIPE_SOURCE.AUTO_SWIPE, repeated: true, forceMesId: chat.length - 1 });
         }
@@ -5625,7 +5640,10 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
         }
     }
 
-    return finishGenerating().then(onSuccess, onError);
+    continuousMultiSwipeGenerationDepth++;
+    return finishGenerating()
+        .then(onSuccess, onError)
+        .finally(() => continuousMultiSwipeGenerationDepth--);
 
     /**
      * Handles the successful response from the generation API.
@@ -5734,6 +5752,8 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
             }
         }
 
+        recordContinuousMultiSwipeResult(originalType, chat[chat.length - 1], swipes.length > 0);
+
         if (type !== 'quiet') {
             playMessageSound();
         }
@@ -5777,9 +5797,119 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
 //MARK: Generate() ends
 
 /**
+ * Records whether a completed foreground generation produced alternate choices.
+ * Automatic repeats reuse the ordinary overswipe path and update the same session.
+ * @param {string} type Generation type.
+ * @param {ChatMessage} target Generated assistant message.
+ * @param {boolean} hasAlternatives Whether the response actually produced alternate choices.
+ */
+function recordContinuousMultiSwipeResult(type, target, hasAlternatives) {
+    if (!['normal', 'regenerate', 'swipe'].includes(type) || !target || target.is_user || target.is_system) {
+        return;
+    }
+
+    if (continuousMultiSwipeSession) {
+        if (continuousMultiSwipeSession.target === target) {
+            continuousMultiSwipeSession.eligible = hasAlternatives;
+        }
+        return;
+    }
+
+    if (!hasAlternatives || !power_user.continuous_multi_swipe_generation || chat[chat.length - 1] !== target) {
+        return;
+    }
+
+    const session = {
+        target,
+        chatId: getCurrentChatId(),
+        canceled: false,
+        eligible: true,
+        automaticRequest: false,
+        task: /** @type {Promise<void>} */ (Promise.resolve()),
+    };
+    continuousMultiSwipeSession = session;
+    session.task = new Promise(resolve => setTimeout(resolve, 0))
+        .then(() => runContinuousMultiSwipeSession(session))
+        .catch(error => console.warn('Continuous multi-swipe generation stopped after an unexpected error.', error))
+        .finally(() => {
+            if (continuousMultiSwipeSession === session) {
+                continuousMultiSwipeSession = null;
+            }
+        });
+}
+
+/**
+ * Runs a detached sequence of ordinary swipe generations.
+ * @param {NonNullable<typeof continuousMultiSwipeSession>} session Active session.
+ */
+async function runContinuousMultiSwipeSession(session) {
+    while (isContinuousMultiSwipeSessionValid(session) && session.eligible) {
+        while ((isGenerating() || swipeState !== SWIPE_STATE.NONE || continuousMultiSwipeGenerationDepth > 0) && isContinuousMultiSwipeSessionValid(session)) {
+            await delay(10);
+        }
+        if (!isContinuousMultiSwipeSessionValid(session) || !session.eligible) {
+            return;
+        }
+
+        session.eligible = false;
+        session.automaticRequest = true;
+        try {
+            await swipe(null, SWIPE_DIRECTION.RIGHT, {
+                source: SWIPE_SOURCE.AUTO_SWIPE,
+                repeated: true,
+                message: session.target,
+                forceMesId: chat.length - 1,
+                forceSwipeId: session.target.swipes.length,
+            });
+        } catch (error) {
+            console.warn('Continuous multi-swipe request failed.', error);
+            return;
+        } finally {
+            session.automaticRequest = false;
+        }
+    }
+}
+
+/**
+ * @param {NonNullable<typeof continuousMultiSwipeSession>} session Active session.
+ * @returns {boolean} Whether another automatic request may start.
+ */
+function isContinuousMultiSwipeSessionValid(session) {
+    return continuousMultiSwipeSession === session
+        && !session.canceled
+        && power_user.continuous_multi_swipe_generation
+        && getCurrentChatId() === session.chatId
+        && chat[chat.length - 1] === session.target
+        && !session.target.is_user
+        && !session.target.is_system;
+}
+
+function cancelContinuousMultiSwipeSession() {
+    if (continuousMultiSwipeSession) {
+        continuousMultiSwipeSession.canceled = true;
+        continuousMultiSwipeSession.eligible = false;
+    }
+}
+
+eventSource.on(event_types.CHAT_CHANGED, cancelContinuousMultiSwipeSession);
+
+/**
+ * Aborts the currently active request without changing the coordinator state.
+ * @param {string} reason Abort reason.
+ */
+function abortActiveGeneration(reason) {
+    streamingProcessor?.onStopStreaming();
+    if (abortController) {
+        abortController.abort(reason);
+        hideStopButton();
+    }
+}
+
+/**
  * Stops the generation and any streaming if it is currently running.
  */
 export function stopGeneration() {
+    cancelContinuousMultiSwipeSession();
     let stopped = false;
     if (streamingProcessor) {
         streamingProcessor.onStopStreaming();

@@ -177,6 +177,7 @@ export const power_user = {
     theme: 'Default (Dark) 1.7.1',
 
     gestures: true,
+    continuous_multi_swipe_generation: false,
     auto_swipe: false,
     auto_swipe_minimum_length: 0,
     auto_swipe_blacklist: [],
@@ -1656,6 +1657,7 @@ export async function loadPowerUserSettings(settings, data) {
     $('#mes_continue').css('display', power_user.quick_continue ? '' : 'none');
     $('#mes_impersonate').css('display', power_user.quick_impersonate ? '' : 'none');
     $('#gestures-checkbox').prop('checked', power_user.gestures);
+    $('#continuous_multi_swipe_generation').prop('checked', !!power_user.continuous_multi_swipe_generation);
     $('#auto_swipe').prop('checked', power_user.auto_swipe);
     $('#auto_swipe_minimum_length').val(power_user.auto_swipe_minimum_length);
     $('#auto_swipe_blacklist').val(power_user.auto_swipe_blacklist.join(', '));
@@ -3565,6 +3567,11 @@ jQuery(() => {
 
     $('#gestures-checkbox').on('change', function () {
         power_user.gestures = !!$('#gestures-checkbox').prop('checked');
+        saveSettingsDebounced();
+    });
+
+    $('#continuous_multi_swipe_generation').on('input', function () {
+        power_user.continuous_multi_swipe_generation = !!$(this).prop('checked');
         saveSettingsDebounced();
     });
 

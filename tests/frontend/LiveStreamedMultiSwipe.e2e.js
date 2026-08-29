@@ -32,8 +32,8 @@ class ControlledSseServer {
         return `http://127.0.0.1:${address.port}/v1/chat/completions`;
     }
 
-    async waitForRequest(requestCount = 1) {
-        await expect.poll(() => this.requestCount).toBeGreaterThanOrEqual(requestCount);
+    async waitForRequest(requestCount = 1, timeout = 5000) {
+        await expect.poll(() => this.requestCount, { timeout }).toBeGreaterThanOrEqual(requestCount);
     }
 
     send(choice) {
@@ -54,7 +54,54 @@ class ControlledSseServer {
     }
 }
 
-async function preparePage(page, server, { n = 3, generationType = 'swipe', seed = true } = {}) {
+class ControlledJsonServer {
+    constructor() {
+        this.requestCount = 0;
+        this.responses = [];
+        this.server = http.createServer((request, response) => {
+            this.requestCount++;
+            request.resume();
+            this.responses.push(response);
+        });
+    }
+
+    async start() {
+        await new Promise(resolve => this.server.listen(0, '127.0.0.1', resolve));
+    }
+
+    get url() {
+        const address = this.server.address();
+        return `http://127.0.0.1:${address.port}/v1/chat/completions`;
+    }
+
+    async waitForRequest(requestCount = 1) {
+        await expect.poll(() => this.requestCount).toBeGreaterThanOrEqual(requestCount);
+    }
+
+    respond(choices) {
+        const response = this.responses.at(-1);
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ choices: choices.map(content => ({ message: { content } })) }));
+    }
+
+    async stop() {
+        for (const response of this.responses) {
+            response.destroy();
+        }
+        await new Promise(resolve => this.server.close(resolve));
+    }
+}
+
+async function preparePage(page, server, {
+    n = 3,
+    generationType = 'swipe',
+    seed = true,
+    continuous,
+    stream = true,
+    startViaSendButton = false,
+    initialText = 'initial request',
+    chatSaveHandler,
+} = {}) {
     await page.goto('/');
     const user = page.locator('#userList .userSelect').last();
     if (await user.count()) await user.click();
@@ -63,10 +110,33 @@ async function preparePage(page, server, { n = 3, generationType = 'swipe', seed
     if (await onboarding.isVisible()) {
         await page.locator('dialog .popup-button-ok').click();
     }
-    await page.route('**/api/chats/save', route => route.fulfill({ status: 200, body: '{}' }));
+    if (startViaSendButton) {
+        await page.waitForFunction(async () => (await import('./script.js')).settingsReady, undefined, { timeout: 0 });
+    }
+    await page.route('**/api/chats/save', chatSaveHandler ?? (route => route.fulfill({ status: 200, body: '{}' })));
     await page.route('**/api/backends/chat-completions/generate', route => route.continue({ url: server.url }));
+    const testCharacter = startViaSendButton ? {
+        name: 'Test Assistant',
+        avatar: 'none',
+        chat: 'continuous-mutex-test',
+        description: '',
+        personality: '',
+        scenario: '',
+        first_mes: '',
+        mes_example: '',
+        data: {
+            name: 'Test Assistant',
+            description: '',
+            personality: '',
+            scenario: '',
+            first_mes: '',
+            mes_example: '',
+            alternate_greetings: [],
+            extensions: {},
+        },
+    } : undefined;
 
-    await page.evaluate(async ({ n, generationType, hasSeed }) => {
+    await page.evaluate(async ({ n, generationType, hasSeed, continuous, stream, startViaSendButton, initialText, testCharacter }) => {
         const script = await import('./script.js');
         const { oai_settings, chat_completion_sources } = await import('./scripts/openai.js');
         const { power_user } = await import('./scripts/power-user.js');
@@ -99,18 +169,32 @@ async function preparePage(page, server, { n = 3, generationType = 'swipe', seed
             chat_completion_source: chat_completion_sources.CUSTOM,
             custom_model: 'live-multiswipe-test',
             custom_url: 'https://example.invalid/v1',
-            stream_openai: true,
+            stream_openai: stream,
             n,
             show_thoughts: true,
         });
         power_user.streaming_fps = 20;
         power_user.auto_swipe = false;
+        if (typeof continuous === 'boolean') {
+            power_user.continuous_multi_swipe_generation = continuous;
+        }
         if (generationType === 'impersonate') {
             script.eventSource.once(event_types.IMPERSONATE_READY, text => globalThis.__ticket2ImpersonateReady = text);
         }
-        globalThis.__ticket2Generation = script.Generate(generationType);
-    }, { n, generationType, hasSeed: seed });
-    await server.waitForRequest();
+        if (startViaSendButton) {
+            script.characters.splice(0, script.characters.length, testCharacter);
+            script.setCharacterId(0);
+            script.setCharacterName(testCharacter.name);
+            globalThis.$('#send_textarea').val(initialText).trigger('input');
+        } else {
+            globalThis.__ticket2Generation = script.Generate(generationType);
+        }
+    }, { n, generationType, hasSeed: seed, continuous, stream, startViaSendButton, initialText, testCharacter });
+    if (startViaSendButton) {
+        await page.waitForFunction(() => globalThis.$?._data(globalThis.document.querySelector('#send_but'), 'events')?.click?.some(event => event.handler.toString().includes('userInputGenerateMutex')), undefined, { timeout: 0 });
+        await page.evaluate(() => globalThis.$('#send_but').trigger('click'));
+    }
+    await server.waitForRequest(1, startViaSendButton ? 15000 : 5000);
     if (generationType !== 'impersonate') {
         await expect(page.locator('#chat .mes.last_mes')).toBeVisible();
     }
@@ -118,6 +202,7 @@ async function preparePage(page, server, { n = 3, generationType = 'swipe', seed
 
 const counterText = locator => locator.evaluate(element => element.textContent.replaceAll('\u200b', ''));
 const clickArrow = locator => locator.evaluate(element => element.click());
+const waitForRequestsToSettle = () => new Promise(resolve => setTimeout(resolve, 150));
 
 test.describe('live streamed multi-swipe navigation', () => {
     /** @type {ControlledSseServer} */
@@ -368,5 +453,233 @@ test.describe('live streamed multi-swipe navigation', () => {
         expect(result.eventText).toBe('impersonated reply');
         expect(result.chat).toHaveLength(1);
         expect(result.chat[0].swipes).toEqual(['old-0', 'old-1']);
+    });
+});
+
+test.describe('continuous multi-swipe generation', () => {
+    /** @type {ControlledSseServer} */
+    let server;
+
+    test.beforeEach(async () => {
+        server = new ControlledSseServer();
+        await server.start();
+    });
+
+    test.afterEach(async () => {
+        await server.stop();
+    });
+
+    test('defaults off and does not request another batch when disabled', async ({ page }) => {
+        await preparePage(page, server);
+        await expect(page.locator('#continuous_multi_swipe_generation')).not.toBeChecked();
+        server.send({ index: 0, delta: { content: 'disabled-primary' } });
+        server.send({ index: 1, delta: { content: 'disabled-alternate' } });
+        server.done();
+        await page.evaluate(() => globalThis.__ticket2Generation);
+        await waitForRequestsToSettle();
+        expect(server.requestCount).toBe(1);
+    });
+
+    test('streams sequential batches through forced overswipe from an old selection and Stop ends the session', async ({ page }) => {
+        await preparePage(page, server, { continuous: true });
+        const message = page.locator('#chat .mes.last_mes');
+        server.send({ index: 0, delta: { content: 'first-primary' } });
+        server.send({ index: 1, delta: { content: 'first-alternate' } });
+        await clickArrow(message.locator('.swipe_left'));
+        await expect(message.locator('.mes_text')).toContainText('old-1');
+        server.done();
+
+        await server.waitForRequest(2);
+        server.send({ index: 0, delta: { content: 'second-primary' } });
+        server.send({ index: 1, delta: { content: 'second-alternate' } });
+        server.done();
+        await server.waitForRequest(3);
+
+        await page.evaluate(async () => (await import('./script.js')).stopGeneration());
+        await expect.poll(() => server.abortedCount).toBeGreaterThanOrEqual(1);
+        await waitForRequestsToSettle();
+        expect(server.requestCount).toBe(3);
+        const result = await page.evaluate(async () => {
+            const message = (await import('./script.js')).chat.at(-1);
+            return { swipeId: message.swipe_id, swipes: message.swipes.slice(0, 6), swipeInfoLength: message.swipe_info.length };
+        });
+        expect(result.swipeId).toBeGreaterThanOrEqual(6);
+        expect(result.swipes).toEqual(['old-0', 'old-1', 'first-primary', 'first-alternate', 'second-primary', 'second-alternate']);
+        expect(result.swipeInfoLength).toBeGreaterThanOrEqual(6);
+    });
+
+    test('a single-choice batch terminates without retrying', async ({ page }) => {
+        await preparePage(page, server, { continuous: true });
+        server.send({ index: 0, delta: { content: 'multi-primary' } });
+        server.send({ index: 1, delta: { content: 'multi-alternate' } });
+        server.done();
+        await server.waitForRequest(2);
+        server.send({ index: 0, delta: { content: 'single-primary' } });
+        server.done();
+        await waitForRequestsToSettle();
+        expect(server.requestCount).toBe(2);
+    });
+
+    test('disabling during an active batch lets it finish and prevents the next request', async ({ page }) => {
+        await preparePage(page, server, { continuous: true });
+        server.send({ index: 0, delta: { content: 'first-primary' } });
+        server.send({ index: 1, delta: { content: 'first-alternate' } });
+        server.done();
+        await server.waitForRequest(2);
+        await page.evaluate(async () => {
+            const { power_user } = await import('./scripts/power-user.js');
+            power_user.continuous_multi_swipe_generation = false;
+        });
+        server.send({ index: 0, delta: { content: 'finished-primary' } });
+        server.send({ index: 1, delta: { content: 'finished-alternate' } });
+        server.done();
+        await waitForRequestsToSettle();
+        expect(server.requestCount).toBe(2);
+        const swipes = await page.evaluate(async () => (await import('./script.js')).chat.at(-1).swipes);
+        expect(swipes).toContain('finished-alternate');
+    });
+
+    test('stream errors terminate without retrying', async ({ page }) => {
+        await preparePage(page, server, { continuous: true });
+        server.send({ index: 0, delta: { content: 'first-primary' } });
+        server.send({ index: 1, delta: { content: 'first-alternate' } });
+        server.done();
+        await server.waitForRequest(2);
+        server.error();
+        await waitForRequestsToSettle();
+        expect(server.requestCount).toBe(2);
+    });
+
+    test('a chat target change during an active batch prevents the next request', async ({ page }) => {
+        await preparePage(page, server, { continuous: true });
+        server.send({ index: 0, delta: { content: 'first-primary' } });
+        server.send({ index: 1, delta: { content: 'first-alternate' } });
+        server.done();
+        await server.waitForRequest(2);
+        await page.evaluate(async () => {
+            const script = await import('./script.js');
+            script.eventSource.emit((await import('./scripts/events.js')).event_types.CHAT_CHANGED, 'different-chat');
+        });
+        server.send({ index: 0, delta: { content: 'changed-primary' } });
+        server.send({ index: 1, delta: { content: 'changed-alternate' } });
+        server.done();
+        await waitForRequestsToSettle();
+        expect(server.requestCount).toBe(2);
+    });
+
+    test('waits for the send mutex to unwind, then a real typed click aborts, sends once, and starts fresh', async ({ page }) => {
+        let saveCount = 0;
+        let releaseCompletionSave = () => {};
+        const completionSaveGate = new Promise(resolve => {
+            releaseCompletionSave = resolve;
+        });
+        const chatSaveHandler = async route => {
+            saveCount++;
+            // eslint-disable-next-line playwright/no-conditional-in-test
+            if (saveCount === 2) {
+                await completionSaveGate;
+            }
+            await route.fulfill({ status: 200, body: '{}' });
+        };
+
+        try {
+            await preparePage(page, server, {
+                continuous: true,
+                generationType: 'normal',
+                startViaSendButton: true,
+                chatSaveHandler,
+            });
+            server.send({ index: 0, delta: { content: 'first-primary' } });
+            server.send({ index: 1, delta: { content: 'first-alternate' } });
+            server.done();
+            await expect.poll(() => saveCount).toBe(2);
+            await waitForRequestsToSettle();
+            expect(server.requestCount).toBe(1);
+
+            releaseCompletionSave();
+            await server.waitForRequest(2);
+            await page.evaluate(() => {
+                globalThis.$('#send_textarea').val('typed exactly once').trigger('input');
+                globalThis.$('#send_but').trigger('click');
+            });
+            await expect.poll(() => server.abortedCount).toBeGreaterThanOrEqual(1);
+            await server.waitForRequest(3);
+            server.send({ index: 0, delta: { content: 'new-primary' } });
+            server.send({ index: 1, delta: { content: 'new-alternate' } });
+            server.done();
+            await server.waitForRequest(4);
+
+            const typedMessages = await page.evaluate(async () => (await import('./script.js')).chat.filter(message => message.is_user && message.mes === 'typed exactly once').length);
+            expect(typedMessages).toBe(1);
+            await page.evaluate(async () => (await import('./script.js')).stopGeneration());
+        } finally {
+            releaseCompletionSave();
+        }
+    });
+
+    test('coordinates with Auto-swipe without launching duplicate batches', async ({ page }) => {
+        await preparePage(page, server, { continuous: true });
+        await page.evaluate(async () => {
+            const { power_user } = await import('./scripts/power-user.js');
+            power_user.auto_swipe = true;
+            power_user.auto_swipe_minimum_length = 1000;
+        });
+        server.send({ index: 0, delta: { content: 'short-primary' } });
+        server.send({ index: 1, delta: { content: 'short-alternate' } });
+        server.done();
+        await server.waitForRequest(2);
+        await waitForRequestsToSettle();
+        expect(server.requestCount).toBe(2);
+        await page.evaluate(async () => (await import('./script.js')).stopGeneration());
+    });
+
+    test('updates and restores the checkbox through power-user settings', async ({ page }) => {
+        await page.goto('/');
+        const user = page.locator('#userList .userSelect').last();
+        // The user picker is absent when this test server already has an active user.
+        // eslint-disable-next-line playwright/no-conditional-in-test
+        if (await user.count()) await user.click();
+        await page.waitForFunction('document.getElementById("preloader") === null', { timeout: 0 });
+        await page.waitForFunction(async () => (await import('./script.js')).settingsReady, { timeout: 0 });
+        await expect(page.locator('#continuous_multi_swipe_generation')).not.toBeChecked();
+
+        await page.evaluate(async () => {
+            globalThis.$('#continuous_multi_swipe_generation').prop('checked', true).trigger('input');
+            const { power_user } = await import('./scripts/power-user.js');
+            if (!power_user.continuous_multi_swipe_generation) throw new Error('Checkbox listener did not update power-user settings.');
+            globalThis.$('#continuous_multi_swipe_generation').prop('checked', false);
+            await (await import('./scripts/power-user.js')).loadPowerUserSettings({ power_user: { continuous_multi_swipe_generation: true } }, {});
+        });
+        await expect(page.locator('#continuous_multi_swipe_generation')).toBeChecked();
+
+        await page.evaluate(async () => {
+            await (await import('./scripts/power-user.js')).loadPowerUserSettings({ power_user: { continuous_multi_swipe_generation: false } }, {});
+        });
+        await expect(page.locator('#continuous_multi_swipe_generation')).not.toBeChecked();
+    });
+});
+
+test.describe('non-streaming continuous multi-swipe generation', () => {
+    /** @type {ControlledJsonServer} */
+    let server;
+
+    test.beforeEach(async () => {
+        server = new ControlledJsonServer();
+        await server.start();
+    });
+
+    test.afterEach(async () => {
+        await server.stop();
+    });
+
+    test('requests sequential batches and stops after a single-choice response', async ({ page }) => {
+        await preparePage(page, server, { continuous: true, stream: false });
+        server.respond(['json-primary', 'json-alternate']);
+        await server.waitForRequest(2);
+        server.respond(['json-single']);
+        await waitForRequestsToSettle();
+        expect(server.requestCount).toBe(2);
+        const swipes = await page.evaluate(async () => (await import('./script.js')).chat.at(-1).swipes);
+        expect(swipes).toEqual(['old-0', 'old-1', 'json-primary', 'json-alternate', 'json-single']);
     });
 });
