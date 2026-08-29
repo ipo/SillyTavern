@@ -3517,8 +3517,8 @@ class StreamingProcessor {
         this.swipeReasoning = [];
         /** @type {number?} Stable absolute swipe ID assigned to provider choice 0. */
         this.primarySwipeId = null;
-        /** @type {number} Provider choice currently rendered in the live message. */
-        this.selectedProviderIndex = 0;
+        /** @type {string} Stable combined entry currently rendered in the live message. */
+        this.selectedLiveSwipe = 'primary';
         /** @type {Set<number>} Provider choices that have actually appeared in the stream. */
         this.observedProviderIndexes = new Set();
         this.alternativesFinalized = false;
@@ -3561,21 +3561,52 @@ class StreamingProcessor {
             .sort((a, b) => a - b);
     }
 
+    /**
+     * Returns the currently navigable history without changing the persisted selection.
+     * @returns {{ key: string, type: 'persisted' | 'primary' | 'alternative', swipeId?: number, providerIndex?: number }[]}
+     */
+    #getLiveSwipeEntries() {
+        const message = chat[this.messageId];
+        const primarySwipeId = Number(this.primarySwipeId);
+        if (!message || !Number.isInteger(primarySwipeId) || primarySwipeId < 0) {
+            return [];
+        }
+
+        const persisted = Array.from({ length: Math.min(primarySwipeId, message.swipes?.length ?? 0) }, (_, swipeId) => ({
+            key: `persisted:${swipeId}`,
+            type: /** @type {'persisted'} */ ('persisted'),
+            swipeId,
+        }));
+        const alternatives = this.#getObservedProviderIndexes()
+            .filter(providerIndex => providerIndex !== 0 && typeof this.swipes[providerIndex - 1] === 'string')
+            .map(providerIndex => ({
+                key: `alternative:${providerIndex}`,
+                type: /** @type {'alternative'} */ ('alternative'),
+                providerIndex,
+            }));
+
+        return [
+            ...persisted,
+            { key: 'primary', type: /** @type {'primary'} */ ('primary'), swipeId: primarySwipeId },
+            ...alternatives,
+        ];
+    }
+
     #updateLiveControls() {
         if (!(this.messageDom instanceof HTMLElement) || this.isStopped || this.alternativesFinalized) {
             return;
         }
 
-        const observed = this.#getObservedProviderIndexes();
-        if (!observed.includes(this.selectedProviderIndex) && observed.length > 0) {
-            this.selectedProviderIndex = observed[0];
+        const entries = this.#getLiveSwipeEntries();
+        if (!entries.some(entry => entry.key === this.selectedLiveSwipe)) {
+            this.selectedLiveSwipe = 'primary';
             this.#renderLiveSelection();
         }
-        if (observed.length < 2) {
+        if (entries.length < 2) {
             return;
         }
 
-        const position = observed.indexOf(this.selectedProviderIndex);
+        const position = entries.findIndex(entry => entry.key === this.selectedLiveSwipe);
         if (position === -1) {
             return;
         }
@@ -3585,12 +3616,12 @@ class StreamingProcessor {
         const right = this.messageDom.querySelector('.swipe_right');
         const counter = this.messageDom.querySelector('.swipes-counter');
         left?.setAttribute('aria-disabled', String(position === 0));
-        right?.setAttribute('aria-disabled', String(position === observed.length - 1));
+        right?.setAttribute('aria-disabled', String(position === entries.length - 1));
         left?.classList.toggle('live-swipe-boundary', position === 0);
-        right?.classList.toggle('live-swipe-boundary', position === observed.length - 1);
+        right?.classList.toggle('live-swipe-boundary', position === entries.length - 1);
         if (counter instanceof HTMLElement) {
             counter.hidden = false;
-            counter.textContent = formatSwipeCounter(position + 1, observed.length);
+            counter.textContent = formatSwipeCounter(position + 1, entries.length);
             counter.classList.remove('swipe-picker-enabled', INTERACTABLE_CONTROL_CLASS);
             counter.removeAttribute('role');
             counter.removeAttribute('title');
@@ -3643,14 +3674,35 @@ class StreamingProcessor {
         return { ...message, mes: texts[0], extra: swipeInfo[0].extra };
     }
 
+    #getPersistedSwipeSnapshot(swipeId) {
+        const message = chat[this.messageId];
+        const text = message?.swipes?.[swipeId];
+        const swipeInfo = message?.swipe_info?.[swipeId];
+        if (!message || typeof text !== 'string' || !swipeInfo || typeof swipeInfo !== 'object') {
+            return null;
+        }
+
+        return {
+            ...message,
+            mes: text,
+            send_date: swipeInfo.send_date,
+            gen_started: swipeInfo.gen_started,
+            gen_finished: swipeInfo.gen_finished,
+            extra: structuredClone(swipeInfo.extra ?? {}),
+        };
+    }
+
     #renderLiveSelection(isFinal = false) {
         if (!(this.messageTextDom instanceof HTMLElement) || !chat[this.messageId]) {
             return;
         }
 
-        const snapshot = this.selectedProviderIndex === 0
-            ? chat[this.messageId]
-            : this.#getAlternateSnapshot(this.selectedProviderIndex, isFinal);
+        const entry = this.#getLiveSwipeEntries().find(entry => entry.key === this.selectedLiveSwipe);
+        const snapshot = entry?.type === 'persisted'
+            ? this.#getPersistedSwipeSnapshot(entry.swipeId)
+            : entry?.type === 'alternative'
+                ? this.#getAlternateSnapshot(entry.providerIndex, isFinal)
+                : chat[this.messageId];
         if (!snapshot) {
             return;
         }
@@ -3660,7 +3712,7 @@ class StreamingProcessor {
         } else {
             this.messageTextDom.innerHTML = formattedText;
         }
-        if (this.selectedProviderIndex === 0) {
+        if (entry?.type === 'primary') {
             this.reasoningHandler.updateDom(this.messageId);
         } else {
             updateReasoningUI(this.messageDom, { messageSnapshot: snapshot });
@@ -3676,16 +3728,16 @@ class StreamingProcessor {
         if (source !== undefined || !isArrow || messageId !== this.messageId || this.isStopped || this.isFinished || this.alternativesFinalized) {
             return false;
         }
-        const observed = this.#getObservedProviderIndexes();
-        if (observed.length < 2) {
+        const entries = this.#getLiveSwipeEntries();
+        if (entries.length < 2) {
             return false;
         }
-        const position = observed.indexOf(this.selectedProviderIndex);
+        const position = entries.findIndex(entry => entry.key === this.selectedLiveSwipe);
         const nextPosition = direction === SWIPE_DIRECTION.RIGHT ? position + 1 : position - 1;
-        if (position < 0 || nextPosition < 0 || nextPosition >= observed.length) {
+        if (position < 0 || nextPosition < 0 || nextPosition >= entries.length) {
             return true;
         }
-        this.selectedProviderIndex = observed[nextPosition];
+        this.selectedLiveSwipe = entries[nextPosition].key;
         this.#renderLiveSelection();
         this.#updateLiveControls();
         return true;
@@ -3780,35 +3832,19 @@ class StreamingProcessor {
             }
 
             if ((this.type == 'swipe' || this.type === 'continue') && Array.isArray(chat[messageId].swipes)) {
-                chat[messageId].swipes[chat[messageId].swipe_id] = processedText;
-                chat[messageId].swipe_info[chat[messageId].swipe_id] = {
-                    'send_date': chat[messageId].send_date,
-                    'gen_started': chat[messageId].gen_started,
-                    'gen_finished': chat[messageId].gen_finished,
-                    'extra': structuredClone(chat[messageId].extra),
-                };
-            }
-
-            const formattedText = messageFormatting(
-                processedText,
-                chat[messageId].name,
-                chat[messageId].is_system,
-                chat[messageId].is_user,
-                messageId,
-                {},
-                false,
-            );
-            if (this.messageTextDom instanceof HTMLElement) {
-                if (power_user.stream_fade_in) {
-                    applyStreamFadeIn(this.messageTextDom, formattedText);
-                } else {
-                    this.messageTextDom.innerHTML = formattedText;
+                const primarySwipeId = Number(this.primarySwipeId);
+                if (Number.isInteger(primarySwipeId) && primarySwipeId >= 0) {
+                    chat[messageId].swipes[primarySwipeId] = processedText;
+                    chat[messageId].swipe_info[primarySwipeId] = {
+                        'send_date': chat[messageId].send_date,
+                        'gen_started': chat[messageId].gen_started,
+                        'gen_finished': chat[messageId].gen_finished,
+                        'extra': structuredClone(chat[messageId].extra),
+                    };
                 }
             }
 
-            if (this.selectedProviderIndex !== 0) {
-                this.#renderLiveSelection();
-            }
+            this.#renderLiveSelection();
             this.#updateLiveControls();
 
             const timePassed = formatGenerationTimer(this.timeStarted, currentTime, currentTokenCount, this.reasoningHandler.getDuration(), this.timeToFirstToken);
@@ -3841,11 +3877,19 @@ class StreamingProcessor {
         await this.reasoningHandler.finish(messageId);
 
         if (message && !this.alternativesFinalized) {
+            if (this.reasoningSignature) {
+                message.extra = message.extra || {};
+                message.extra.reasoning_signature = this.reasoningSignature;
+            }
+            if (Array.isArray(this.images) && this.images.length > 0) {
+                await processImageAttachment(message, { imageUrls: this.images });
+            }
             syncMesToSwipe(messageId);
             const observed = this.#getObservedProviderIndexes();
             const alternativeProviderIndexes = observed.filter(providerIndex => providerIndex !== 0);
-            const finalizedProviderIndexes = [0, ...alternativeProviderIndexes];
-            const finalizedSwipes = alternativeProviderIndexes.map(providerIndex => this.#getAlternateSnapshot(providerIndex, true));
+            const finalizedAlternatives = alternativeProviderIndexes
+                .map(providerIndex => ({ providerIndex, snapshot: this.#getAlternateSnapshot(providerIndex, true) }))
+                .filter(({ snapshot }) => snapshot !== null);
             const swipeInfoExtra = structuredClone(message.extra ?? {});
             delete swipeInfoExtra.token_count;
             delete swipeInfoExtra.reasoning;
@@ -3857,16 +3901,20 @@ class StreamingProcessor {
                 gen_finished: message.gen_finished,
                 extra: swipeInfoExtra,
             };
-            const finalTexts = finalizedSwipes.map(snapshot => snapshot.mes);
-            const swipeInfoArray = finalizedSwipes.map(snapshot => {
+            const finalTexts = finalizedAlternatives.map(({ snapshot }) => snapshot.mes);
+            const swipeInfoArray = finalizedAlternatives.map(({ snapshot }) => {
                 const info = { ...structuredClone(swipeInfo), extra: structuredClone(snapshot.extra) };
                 delete info.extra.reasoning_state;
                 return info;
             });
             message.swipes.push(...finalTexts);
             message.swipe_info.push(...swipeInfoArray);
-            const selectedPosition = finalizedProviderIndexes.indexOf(this.selectedProviderIndex);
-            const selectedSwipeId = Number(this.primarySwipeId) + Math.max(0, selectedPosition);
+            const selectedEntry = this.#getLiveSwipeEntries().find(entry => entry.key === this.selectedLiveSwipe);
+            const selectedSwipeId = selectedEntry?.type === 'persisted'
+                ? selectedEntry.swipeId
+                : selectedEntry?.type === 'alternative'
+                    ? Number(this.primarySwipeId) + 1 + finalizedAlternatives.findIndex(({ providerIndex }) => providerIndex === selectedEntry.providerIndex)
+                    : Number(this.primarySwipeId);
             syncSwipeToMes(messageId, selectedSwipeId);
             this.alternativesFinalized = true;
         }
@@ -3884,14 +3932,7 @@ class StreamingProcessor {
         saveLogprobsForActiveMessage(this.messageLogprobs.filter(Boolean), this.continueMessage);
 
         if (Array.isArray(this.images) && this.images.length > 0) {
-            await processImageAttachment(message, { imageUrls: this.images });
             appendMediaToMessage(message, $(this.messageDom));
-        }
-
-        // Store reasoning signature for models that support multi-turn context
-        if (this.reasoningSignature) {
-            message.extra = message.extra || {};
-            message.extra.reasoning_signature = this.reasoningSignature;
         }
 
         if (unlockUI) {
@@ -3955,7 +3996,7 @@ class StreamingProcessor {
     }
 
     #discardLiveAlternatives() {
-        this.selectedProviderIndex = 0;
+        this.selectedLiveSwipe = 'primary';
         this.observedProviderIndexes.clear();
         this.swipes = [];
         this.swipeReasoning = [];

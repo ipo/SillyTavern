@@ -32,8 +32,8 @@ class ControlledSseServer {
         return `http://127.0.0.1:${address.port}/v1/chat/completions`;
     }
 
-    async waitForRequest() {
-        await expect.poll(() => this.response !== null).toBe(true);
+    async waitForRequest(requestCount = 1) {
+        await expect.poll(() => this.requestCount).toBeGreaterThanOrEqual(requestCount);
     }
 
     send(choice) {
@@ -54,7 +54,7 @@ class ControlledSseServer {
     }
 }
 
-async function preparePage(page, server, { n = 3, generationType = 'swipe' } = {}) {
+async function preparePage(page, server, { n = 3, generationType = 'swipe', seed = true } = {}) {
     await page.goto('/');
     const user = page.locator('#userList .userSelect').last();
     if (await user.count()) await user.click();
@@ -66,7 +66,7 @@ async function preparePage(page, server, { n = 3, generationType = 'swipe' } = {
     await page.route('**/api/chats/save', route => route.fulfill({ status: 200, body: '{}' }));
     await page.route('**/api/backends/chat-completions/generate', route => route.continue({ url: server.url }));
 
-    await page.evaluate(async ({ n, generationType }) => {
+    await page.evaluate(async ({ n, generationType, hasSeed }) => {
         const script = await import('./script.js');
         const { oai_settings, chat_completion_sources } = await import('./scripts/openai.js');
         const { power_user } = await import('./scripts/power-user.js');
@@ -78,19 +78,21 @@ async function preparePage(page, server, { n = 3, generationType = 'swipe' } = {
             gen_finished: `old-finish-${index}`,
             extra: { marker: `old-${index}` },
         });
-        const seed = {
-            name: 'Test Assistant',
-            is_user: false,
-            is_system: false,
-            send_date: 'old-1',
-            mes: 'old-1',
-            swipe_id: 2,
-            swipes: ['old-0', 'old-1'],
-            swipe_info: [oldInfo(0), oldInfo(1)],
-            extra: { marker: 'old-1' },
-        };
-        script.chat.push(seed);
-        script.addOneMessage(seed, { scroll: false });
+        if (hasSeed) {
+            const message = {
+                name: 'Test Assistant',
+                is_user: false,
+                is_system: false,
+                send_date: 'old-1',
+                mes: 'old-1',
+                swipe_id: 2,
+                swipes: ['old-0', 'old-1'],
+                swipe_info: [oldInfo(0), oldInfo(1)],
+                extra: { marker: 'old-1' },
+            };
+            script.chat.push(message);
+            script.addOneMessage(message, { scroll: false });
+        }
         globalThis.$('#main_api').val('openai').trigger('change');
         script.setOnlineStatus('Connected');
         Object.assign(oai_settings, {
@@ -107,8 +109,11 @@ async function preparePage(page, server, { n = 3, generationType = 'swipe' } = {
             script.eventSource.once(event_types.IMPERSONATE_READY, text => globalThis.__ticket2ImpersonateReady = text);
         }
         globalThis.__ticket2Generation = script.Generate(generationType);
-    }, { n, generationType });
+    }, { n, generationType, hasSeed: seed });
     await server.waitForRequest();
+    if (generationType !== 'impersonate') {
+        await expect(page.locator('#chat .mes.last_mes')).toBeVisible();
+    }
 }
 
 const counterText = locator => locator.evaluate(element => element.textContent.replaceAll('\u200b', ''));
@@ -127,48 +132,58 @@ test.describe('live streamed multi-swipe navigation', () => {
         await server.stop();
     });
 
-    test('navigates only observed choices and finalizes the selected choice once', async ({ page }) => {
+    test('combines persisted and sparse live choices without changing persisted data', async ({ page }) => {
         await preparePage(page, server);
         const message = page.locator('#chat .mes.last_mes');
         const counter = message.locator('.swipes-counter');
 
-        server.send({ index: 0, delta: { reasoning_content: 'reasoning-0', content: 'primary-a' } });
-        await expect(message.locator('.mes_text')).toContainText('primary-a');
-        await expect(message).not.toHaveClass(/live-multiswipe/);
-
-        server.send({ index: 2, delta: { reasoning_content: 'reasoning-2', content: 'choice-2a' } });
-        await expect.poll(() => counterText(counter)).toBe('1/2');
-
-        await clickArrow(message.locator('.swipe_right'));
-        await expect(message.locator('.mes_text')).toContainText('choice-2a');
-        await expect.poll(() => counterText(counter)).toBe('2/2');
-
-        server.send({ index: 0, delta: { content: '-primary-b' } });
-        await expect.poll(() => message.locator('.mes_text').textContent()).toContain('choice-2a');
-        await clickArrow(message.locator('.swipe_right'));
-        await clickArrow(message.locator('.swipe_right'));
-        expect(server.requestCount).toBe(1);
-        expect(server.abortedCount).toBe(0);
-
-        server.send({ index: 1, delta: { reasoning_content: 'reasoning-1', content: 'choice-1' } });
+        server.send({ index: 0, delta: { reasoning_content: 'reasoning-0', content: 'primary-a.' } });
+        await expect(message.locator('.mes_text')).toContainText('primary-a.');
+        await expect(message).toHaveClass(/live-multiswipe/);
         await expect.poll(() => counterText(counter)).toBe('3/3');
-        await expect(message.locator('.mes_text')).toContainText('choice-2a');
+
+        server.send({ index: 2, delta: { reasoning_content: 'reasoning-2', content: 'choice-2a.' } });
+        await expect.poll(() => counterText(counter)).toBe('3/4');
+        await clickArrow(message.locator('.swipe_right'));
+        await expect(message.locator('.mes_text')).toContainText('choice-2a.');
+        await expect.poll(() => counterText(counter)).toBe('4/4');
+
+        server.send({ index: 0, delta: { content: '-primary-b.' } });
+        await expect(message.locator('.mes_text')).toContainText('choice-2a.');
+        server.send({ index: 1, delta: { reasoning_content: 'reasoning-1', content: 'choice-1.' } });
+        await expect.poll(() => counterText(counter)).toBe('5/5');
 
         await clickArrow(message.locator('.swipe_left'));
-        await expect(message.locator('.mes_text')).toContainText('choice-1');
-        await expect.poll(() => counterText(counter)).toBe('2/3');
-        server.send({ index: 2, delta: { content: '-choice-2b' } });
-        await expect.poll(() => message.locator('.mes_text').textContent()).toContain('choice-1');
+        await expect(message.locator('.mes_text')).toContainText('choice-1.');
+        server.send({ index: 2, delta: { content: '-choice-2b.' } });
+        await expect(message.locator('.mes_text')).toContainText('choice-1.');
         await clickArrow(message.locator('.swipe_left'));
-        await expect(message.locator('.mes_text')).toContainText('primary-a-primary-b');
-        await expect.poll(() => counterText(counter)).toBe('1/3');
+        await expect(message.locator('.mes_text')).toContainText('primary-a.-primary-b.');
         await clickArrow(message.locator('.swipe_left'));
+        await expect(message.locator('.mes_text')).toContainText('old-1');
+        await expect.poll(() => counterText(counter)).toBe('2/5');
+        const oldSnapshot = await page.evaluate(async () => {
+            const { chat } = await import('./script.js');
+            return structuredClone({ swipeId: chat.at(-1).swipe_id, old: chat.at(-1).swipe_info.slice(0, 2), swipes: chat.at(-1).swipes.slice(0, 2) });
+        });
+        server.send({ index: 0, delta: { content: '-primary-c.' } });
+        server.send({ index: 1, delta: { content: '-choice-1b.' } });
+        await expect(message.locator('.mes_text')).toContainText('old-1');
+        await expect.poll(async () => page.evaluate(async () => {
+            const { chat } = await import('./script.js');
+            return JSON.stringify({ swipeId: chat.at(-1).swipe_id, old: chat.at(-1).swipe_info.slice(0, 2), swipes: chat.at(-1).swipes.slice(0, 2) });
+        })).toBe(JSON.stringify(oldSnapshot));
+
+        await clickArrow(message.locator('.swipe_left'));
+        await expect(message.locator('.mes_text')).toContainText('old-0');
         await clickArrow(message.locator('.swipe_left'));
         expect(server.requestCount).toBe(1);
         expect(server.abortedCount).toBe(0);
         await clickArrow(message.locator('.swipe_right'));
         await clickArrow(message.locator('.swipe_right'));
-        await expect(message.locator('.mes_text')).toContainText('choice-2a-choice-2b');
+        await clickArrow(message.locator('.swipe_right'));
+        await clickArrow(message.locator('.swipe_right'));
+        await expect(message.locator('.mes_text')).toContainText('choice-2a.-choice-2b.');
 
         server.done();
         await page.evaluate(() => globalThis.__ticket2Generation);
@@ -184,22 +199,79 @@ test.describe('live streamed multi-swipe navigation', () => {
                 liveClass: globalThis.document.querySelector('#chat .mes.last_mes').classList.contains('live-multiswipe'),
             };
         });
-        expect(result.saved.swipes).toEqual(['old-0', 'old-1', 'primary-a-primary-b', 'choice-1', 'choice-2a-choice-2b']);
+        expect(result.saved.swipes).toEqual(['old-0', 'old-1', 'primary-a.-primary-b.-primary-c.', 'choice-1.-choice-1b.', 'choice-2a.-choice-2b.']);
         expect(result.saved.swipe_info).toHaveLength(5);
         expect(result.saved.swipe_id).toBe(4);
-        expect(result.saved.mes).toBe('choice-2a-choice-2b');
+        expect(result.saved.mes).toBe('choice-2a.-choice-2b.');
         expect(result.saved.extra.reasoning).toBe('reasoning-2');
         expect(result.saved.swipe_info.slice(0, 2).map(info => info.extra.marker)).toEqual(['old-0', 'old-1']);
-        expect(result.saved.swipes.every(value => typeof value === 'string')).toBe(true);
-        expect(result.reloaded).toEqual({ mes: 'choice-2a-choice-2b', reasoning: 'reasoning-2' });
+        expect(result.reloaded).toEqual({ mes: 'choice-2a.-choice-2b.', reasoning: 'reasoning-2' });
         expect(result.liveClass).toBe(false);
-        expect(server.requestCount).toBe(1);
-        expect(server.abortedCount).toBe(0);
+    });
+
+    test('maps primary and persisted selections across a second manual batch', async ({ page }) => {
+        await preparePage(page, server);
+        const message = page.locator('#chat .mes.last_mes');
+
+        server.send({ index: 0, delta: { content: 'first-primary' } });
+        server.send({ index: 1, delta: { content: 'first-alternate' } });
+        server.done();
+        await page.evaluate(() => globalThis.__ticket2Generation);
+
+        await expect.poll(async () => page.evaluate(async () => {
+            const { chat } = await import('./script.js');
+            return JSON.stringify({ swipeId: chat.at(-1).swipe_id, mes: chat.at(-1).mes, swipes: chat.at(-1).swipes });
+        })).toBe(JSON.stringify({
+            swipeId: 2,
+            mes: 'first-primary',
+            swipes: ['old-0', 'old-1', 'first-primary', 'first-alternate'],
+        }));
 
         await page.evaluate(async () => (await import('./script.js')).showSwipeButtons());
-        await clickArrow(message.locator('.swipe_left'));
-        await expect(message.locator('.mes_text')).toContainText('choice-1');
+        await clickArrow(message.locator('.swipe_right'));
         await expect.poll(async () => page.evaluate(async () => (await import('./script.js')).chat.at(-1).swipe_id)).toBe(3);
+        await expect.poll(() => page.evaluate(() => !globalThis.document.body.dataset.swiping)).toBe(true);
+        await page.evaluate(async () => {
+            const script = await import('./script.js');
+            script.chat.at(-1).swipe_id = script.chat.at(-1).swipes.length;
+            globalThis.__ticket2Generation = script.Generate('swipe');
+        });
+        await server.waitForRequest(2);
+        server.send({ index: 0, delta: { content: 'second-primary' } });
+        await expect(message).toHaveClass(/live-multiswipe/);
+        await expect.poll(() => counterText(message.locator('.swipes-counter'))).toBe('5/5');
+        server.send({ index: 3, delta: { content: 'second-alternate' } });
+        await expect.poll(() => counterText(message.locator('.swipes-counter'))).toBe('5/6');
+
+        await clickArrow(message.locator('.swipe_left'));
+        await clickArrow(message.locator('.swipe_left'));
+        await clickArrow(message.locator('.swipe_left'));
+        await expect(message.locator('.mes_text')).toContainText('old-1');
+        server.send({ index: 0, delta: { content: '-continued' } });
+        await expect(message.locator('.mes_text')).toContainText('old-1');
+        server.done();
+        await page.evaluate(() => globalThis.__ticket2Generation);
+
+        const result = await page.evaluate(async () => {
+            const { chat } = await import('./script.js');
+            const saved = chat.at(-1);
+            const reloaded = structuredClone(saved);
+            (await import('./script.js')).syncSwipeToMes(null, saved.swipe_id, reloaded);
+            return {
+                swipeId: saved.swipe_id,
+                mes: saved.mes,
+                swipes: saved.swipes,
+                swipeInfoLength: saved.swipe_info.length,
+                reloaded: { mes: reloaded.mes, marker: reloaded.extra.marker },
+            };
+        });
+        expect(result).toEqual({
+            swipeId: 1,
+            mes: 'old-1',
+            swipes: ['old-0', 'old-1', 'first-primary', 'first-alternate', 'second-primary-continued', 'second-alternate'],
+            swipeInfoLength: 6,
+            reloaded: { mes: 'old-1', marker: 'old-1' },
+        });
     });
 
     test('stopping discards transient alternatives and restores the primary partial', async ({ page }) => {
@@ -266,16 +338,16 @@ test.describe('live streamed multi-swipe navigation', () => {
         });
     });
 
-    test('n=1 never exposes transient multi-swipe controls', async ({ page }) => {
-        await preparePage(page, server, { n: 1 });
+    test('a true one-entry message never exposes transient multi-swipe controls', async ({ page }) => {
+        await preparePage(page, server, { n: 1, generationType: 'normal', seed: false });
         const message = page.locator('#chat .mes.last_mes');
-        server.send({ index: 0, delta: { content: 'single-choice' } });
-        await expect(message.locator('.mes_text')).toContainText('single-choice');
+        server.send({ index: 0, delta: { content: 'single-choice.' } });
+        await expect(message.locator('.mes_text')).toContainText('single-choice.');
         await expect(message).not.toHaveClass(/live-multiswipe/);
         server.done();
         await page.evaluate(() => globalThis.__ticket2Generation);
         const swipes = await page.evaluate(async () => (await import('./script.js')).chat.at(-1).swipes);
-        expect(swipes).toEqual(['old-0', 'old-1', 'single-choice']);
+        expect(swipes).toEqual(['single-choice.']);
     });
 
     test('n=1 streamed impersonation finalizes without requiring a chat message', async ({ page }) => {
